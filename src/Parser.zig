@@ -21,9 +21,9 @@ pub const Node = union(enum) {
     text: []Section,
     line_break: void,
     horizontal_rule: void,
+    block_quote: std.ArrayList(*Node),
     // TODO: All the bellow need to be implemented
     table: []Column,
-    block_quote: void,
     footnote: []Section,
     /// > [!x]
     /// >
@@ -137,7 +137,13 @@ const Context = struct {
     previous_node: ?*Node = null,
     previous_heading: ?*Node = null,
 
-    fn findParentNode(previous_node: ?*Node, level: u8) ?*Node {
+    fn skipBlank(line: []const u8) usize {
+        var i: usize = 0;
+        while (std.ascii.isWhitespace(line[i])) : (i += 1) {}
+        return i;
+    }
+
+    fn findParentHadingNode(previous_node: ?*Node, level: u8) ?*Node {
         var n = previous_node orelse return null;
 
         while (n.heading.level > level) {
@@ -147,17 +153,11 @@ const Context = struct {
         return n;
     }
 
-    fn skipBlank(line: []const u8) usize {
-        var i: usize = 0;
-        while (std.ascii.isWhitespace(line[i])) : (i += 1) {}
-        return i;
-    }
-
     fn appendHeadingNode(ctx: *Context, arena: std.mem.Allocator, level: u8, line: []const u8, options: Options) !void {
         const bracket_index = std.mem.findScalarLast(u8, line, '{');
         const id: ?[]const u8 = if (bracket_index != null and line[line.len - 1] == '}') line[bracket_index.? .. line.len - 2] else null;
 
-        const parent_node = findParentNode(ctx.previous_heading, level);
+        const parent_node = findParentHadingNode(ctx.previous_heading, level);
 
         const node = try arena.create(Node);
         node.* = .{
@@ -174,6 +174,45 @@ const Context = struct {
         try ctx.appendNode(arena, node);
     }
 
+    fn innerAppendBlockQuoteNode(
+        ctx: *Context,
+        arena: std.mem.Allocator,
+        block: *std.ArrayList(*Node),
+        line: []const u8,
+        options: Options,
+    ) !void {
+        _ = ctx;
+
+        var inner_ctx: Context = .{ .graph = block.* };
+        try inner_ctx.parseLine(arena, line, options);
+        block.* = inner_ctx.graph;
+    }
+
+    fn appendBlockQuoteNode(ctx: *Context, arena: std.mem.Allocator, depth: u8, line: []const u8, options: Options) !void {
+        if (ctx.previous_node) |previous_node| {
+            switch (previous_node.*) {
+                .block_quote => |*block_node| {
+                    var i: usize = 1;
+                    var n = block_node;
+                    while (i < depth) : (i += 1) {
+                        if (n.items.len == 0) return try ctx.innerAppendBlockQuoteNode(arena, n, line, options);
+                        const b = n.items[n.items.len - 1];
+                        if (b.* == .block_quote) n = &b.block_quote;
+                    }
+
+                    return try ctx.innerAppendBlockQuoteNode(arena, n, line, options);
+                },
+                else => {},
+            }
+        }
+
+        const node = try arena.create(Node);
+        node.* = .{ .block_quote = .empty };
+
+        try ctx.innerAppendBlockQuoteNode(arena, &node.block_quote, line, options);
+        return try ctx.appendNode(arena, node);
+    }
+
     fn innerAppendListNode(
         ctx: *Context,
         arena: std.mem.Allocator,
@@ -183,9 +222,11 @@ const Context = struct {
         options: Options,
     ) !void {
         _ = ctx;
+
         const element = try arena.create(Node.Element);
+
         element.* = .{
-            .text = try parseLineText(arena, line, options),
+            .text = try parseLineText(arena, line[skipBlank(line)..], options),
             .children = .empty,
             .data = element_data,
         };
@@ -566,7 +607,8 @@ const Context = struct {
         }
     }
 
-    fn parseLine(ctx: *Context, arena: std.mem.Allocator, raw_line: []const u8, options: Options) !void {
+    // TODO: This should use a Reader instead
+    fn parseLine(ctx: *Context, arena: std.mem.Allocator, raw_line: []const u8, options: Options) std.mem.Allocator.Error!void {
         if (raw_line.len == 0) {
             if (ctx.previous_heading) |heading| {
                 if (ctx.previous_node) |node| {
@@ -587,6 +629,7 @@ const Context = struct {
 
         const line = if (raw_line[raw_line.len - 1] == '\r') raw_line[0 .. raw_line.len - 2] else raw_line;
 
+        // TODO: Completely rework `previous_node`
         if (ctx.previous_node) |node| {
             switch (node.*) {
                 .code_block => |*block| {
@@ -601,6 +644,17 @@ const Context = struct {
                     }
                 },
                 else => {},
+            }
+        } else if (ctx.graph.items.len > 0 and ctx.graph.items[ctx.graph.items.len - 1].* == .code_block) {
+            const block = &ctx.graph.items[ctx.graph.items.len - 1].code_block;
+            if (!block.closed) {
+                if (std.mem.allEqual(u8, line[Context.skipBlank(line)..], '`')) {
+                    block.closed = true;
+                    return;
+                }
+
+                try block.lines.append(arena, line);
+                return;
             }
         }
 
@@ -679,7 +733,13 @@ const Context = struct {
                     return ctx.appendCodeBlock(arena, skipped, skipped_line[3..]);
                 }
             },
-            // '>' => {},
+            '>' => {
+                var depth: u8 = 1;
+                while (depth < skipped_line.len and skipped_line[depth] == '<') {
+                    depth += 1;
+                }
+                return ctx.appendBlockQuoteNode(arena, depth, skipped_line[depth..], options);
+            },
             // '|' => {},
             // '[' => {},
             '0'...'9' => {

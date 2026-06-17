@@ -55,8 +55,8 @@ pub const Renderer = struct {
 
     pub fn render(self: *Renderer, gpa: std.mem.Allocator, options: InitOptions) !void {
         try self.innerRender(gpa, self.graph, options);
-
-        std.debug.assert(self.current_layout == null);
+        // This still might not be a good idea...
+        self.deinitTextLayout();
     }
 
     fn innerRender(
@@ -64,9 +64,33 @@ pub const Renderer = struct {
         gpa: std.mem.Allocator,
         graph: []*Parser.Node,
         options: InitOptions,
-    ) !void {
+    ) std.mem.Allocator.Error!void {
         for (graph, 0..) |node, i| {
             switch (node.*) {
+                .block_quote => |block| {
+                    self.deinitTextLayout();
+                    var block_quote_box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = i });
+                    defer block_quote_box.deinit();
+
+                    {
+                        var box = dvui.box(@src(), .{}, .{ .gravity_x = 1, .expand = .horizontal });
+                        defer box.deinit();
+
+                        try Renderer.init(gpa, block.items, options);
+                    }
+
+                    const parent_rect = dvui.parentGet().data().rect;
+                    const s: dvui.Size = .{ .h = parent_rect.h, .w = 3 };
+                    _ = dvui.spacer(@src(), .{
+                        .gravity_x = 0,
+                        .background = true,
+                        .color_fill = .fromHex("#555555"),
+                        .min_size_content = s,
+                        .max_size_content = .cast(s),
+                        .margin = .{ .x = 0, .y = 0, .h = 0, .w = 6 },
+                    });
+                },
+
                 .heading => |heading| {
                     self.deinitTextLayout();
 
@@ -151,7 +175,6 @@ pub const Renderer = struct {
                     self.renderList(list, 0, options);
                 },
                 .table => {},
-                .block_quote => {},
                 .footnote => {},
                 .alert => {},
                 .container => {},
@@ -167,14 +190,14 @@ pub const Renderer = struct {
             switch (element.data) {
                 .ordered => |num| {
                     if (initial == 0) initial = if (options.ordered_list_alphabetic) 'a' else @max(num, 1);
-                    tl.format("{[e]c: >[i]}{[num]d}. ", .{ .e = ' ', .i = iter * 4, .num = initial + i }, .{});
+                    tl.format("{[num]d:>[i]}. ", .{ .i = iter * 4, .num = initial + i }, .{});
                 },
                 .unordered => {
                     const indicator = options.unordered_list_indicators[iter % options.unordered_list_indicators.len];
-                    tl.format("{[e]c: >[i]}{[indicator]s} ", .{ .e = ' ', .i = iter * 4, .indicator = indicator }, .{});
+                    tl.format("{[indicator]s:>[i]} ", .{ .i = iter * 4, .indicator = indicator }, .{});
                 },
                 .task => |done| {
-                    tl.format("{[e]c: >[i]} ", .{ .e = ' ', .i = iter * 4 }, .{});
+                    if (iter > 0) tl.format("{[e]c:<[i]}", .{ .e = ' ', .i = iter * 4 }, .{});
                     var wdo: dvui.WidgetData = undefined;
                     checkbox(@src(), done, .{
                         .rect = .fromPoint(tl.insert_pt),
@@ -306,7 +329,7 @@ pub const Renderer = struct {
                     if (options.image.calculate_custom_scale) |scale_fn| {
                         const res = scale_fn(image_size);
                         image_options.min_size_content = res.min;
-                        image_options.max_size_content = .size(res.max);
+                        if (res.max) |max| image_options.max_size_content = .size(max);
                     } else if (options.image.size_limit) |max_size| {
                         if (options.image.manual_scale) {
                             const r = image_size.w / image_size.h;
